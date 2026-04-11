@@ -4,6 +4,13 @@ import base64
 import sqlite3
 from datetime import datetime, timezone
 from langchain_core.tools import tool
+from PIL import Image
+import io
+from langchain_groq import ChatGroq
+from langchain_core.messages import HumanMessage as LCHumanMessage
+from dotenv import load_dotenv
+
+load_dotenv()
 
 DB_FILE = "knowledge.db"
 
@@ -35,14 +42,6 @@ def init_db():
             example     TEXT,
             learned_at  TEXT    NOT NULL
         );
-
-        CREATE TABLE IF NOT EXISTS expressions (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            expression  TEXT    NOT NULL UNIQUE,
-            meaning     TEXT    NOT NULL,
-            example     TEXT,
-            learned_at  TEXT    NOT NULL
-        );
     """)
 
     conn.commit()
@@ -57,28 +56,60 @@ def get_timestamp() -> str:
 @tool
 def extract_knowledge(image_path: str) -> str:
     """Extracts Italian vocabulary, grammar rules, and expressions from
-    a photo of a book page. Use this when the user provides an image path.
+    a photo of a book page using a vision model.
     Args:
         image_path: The full path to the image file on disk.
     """
     if not os.path.exists(image_path):
         return f"Error: file not found at {image_path}"
 
-    with open(image_path, "rb") as f:
-        image_data = base64.standard_b64encode(f.read()).decode("utf-8")
+    # Resize image
+    img = Image.open(image_path).convert("RGB")
+    max_size = 800
+    ratio = min(max_size / img.width, max_size / img.height)
+    if ratio < 1:
+        img = img.resize((int(img.width * ratio), int(img.height * ratio)), Image.LANCZOS)
 
-    return json.dumps({
-        "image_data": image_data,
-        "instruction": (
-            "Look at this Italian textbook page carefully. "
-            "Extract and return a JSON object with exactly these 3 keys:\n"
-            "- 'vocabulary': list of {word, meaning, example}\n"
-            "- 'grammar': list of {rule, explanation, example}\n"
-            "- 'expressions': list of {expression, meaning, example}\n"
-            "Only include items clearly present on the page. "
-            "Return ONLY the JSON object, no extra text."
-        )
-    })
+    buffer = io.BytesIO()
+    img.save(buffer, format="JPEG", quality=70)
+    buffer.seek(0)
+    image_data = base64.standard_b64encode(buffer.read()).decode("utf-8")
+
+    # Call vision model directly here — result is just text, not the image
+    vision_llm = ChatGroq(
+        model="meta-llama/llama-4-scout-17b-16e-instruct",
+        temperature=0.1,
+        api_key=os.getenv("GROQ_API_KEY")
+    )
+
+    vision_response = vision_llm.invoke([
+        LCHumanMessage(content=[
+            {
+                "type": "image_url",
+                "image_url": {
+                    "url": f"data:image/jpeg;base64,{image_data}"
+                }
+            },
+            {
+                "type": "text",
+                "text": (
+                    "Look at this Italian textbook page carefully. "
+                    "Extract and return ONLY a valid JSON object with exactly these 3 keys:\n\n"
+                    "{\n"
+                    '  "vocabulary": [{"word": "...", "meaning": "English meaning", "example": "Italian sentence using the word"}],\n'
+                    '  "grammar": [{"rule": "rule name", "explanation": "brief explanation in English", "example": "Italian example sentence"}],\n'
+                    "}\n\n"
+                    "IMPORTANT:\n"
+                    "- Every item MUST have a non-empty meaning AND example.\n"
+                    "- If you cannot find an example on the page, create a natural one yourself.\n"
+                    "- Return ONLY the JSON, no extra text, no markdown code blocks."
+                )
+            }
+        ])
+    ])
+
+    # Return only the TEXT result — no image data in the agent history!
+    return vision_response.content
 
 
 @tool
@@ -96,7 +127,7 @@ def save_knowledge(extracted_json: str) -> str:
     conn = get_connection()
     cursor = conn.cursor()
     now = get_timestamp()
-    added = {"vocabulary": 0, "grammar": 0, "expressions": 0}
+    added = {"vocabulary": 0, "grammar": 0}
 
     # Vocabulary
     for item in new_items.get("vocabulary", []):
@@ -124,19 +155,6 @@ def save_knowledge(extracted_json: str) -> str:
         except sqlite3.Error:
             continue
 
-    # Expressions
-    for item in new_items.get("expressions", []):
-        try:
-            cursor.execute(
-                "INSERT OR IGNORE INTO expressions (expression, meaning, example, learned_at) "
-                "VALUES (?, ?, ?, ?)",
-                (item.get("expression"), item.get("meaning"), item.get("example"), now)
-            )
-            if cursor.rowcount > 0:
-                added["expressions"] += 1
-        except sqlite3.Error:
-            continue
-
     conn.commit()
     conn.close()
 
@@ -144,7 +162,6 @@ def save_knowledge(extracted_json: str) -> str:
         f"Saved to database! Added: "
         f"{added['vocabulary']} new words, "
         f"{added['grammar']} grammar rules, "
-        f"{added['expressions']} expressions. "
         f"(Duplicates were automatically skipped.)"
     )
 
@@ -173,75 +190,66 @@ def load_knowledge() -> str:
     cursor.execute(f"SELECT rule, explanation, example FROM grammar WHERE learned_at < {cutoff}")
     old_grammar = [dict(row) for row in cursor.fetchall()]
 
-    cursor.execute(f"SELECT expression, meaning, example FROM expressions WHERE learned_at >= {cutoff}")
-    new_exprs = [dict(row) for row in cursor.fetchall()]
-
-    cursor.execute(f"SELECT expression, meaning, example FROM expressions WHERE learned_at < {cutoff}")
-    old_exprs = [dict(row) for row in cursor.fetchall()]
-
     conn.close()
 
-    total = len(new_vocab) + len(old_vocab) + len(new_grammar) + len(old_grammar) + len(new_exprs) + len(old_exprs)
+    total = len(new_vocab) + len(old_vocab) + len(new_grammar) + len(old_grammar)
     if total == 0:
         return "No knowledge saved yet. Process a book page first."
 
     return json.dumps({
         "new": {
             "vocabulary":   new_vocab,
-            "grammar":      new_grammar,
-            "expressions":  new_exprs
+            "grammar":      new_grammar
         },
         "old": {
             "vocabulary":   old_vocab,
-            "grammar":      old_grammar,
-            "expressions":  old_exprs
+            "grammar":      old_grammar
         }
     }, ensure_ascii=False, indent=2)
 
 
 @tool
-def generate_story(knowledge_json: str) -> str:
-    """Generates a short Italian story using all vocabulary, grammar rules,
-    and expressions the user has learned. Focuses heavily on items learned
-    in the last 24 hours while naturally weaving in older knowledge.
-    Args:
-        knowledge_json: JSON string from load_knowledge with 'new' and 'old' sections.
+def generate_story(dummy: str = "") -> str:
+    """Generates a short Italian story using all vocabulary and grammar rules
+    the user has learned so far. Focuses heavily on items learned in the last
+    24 hours. Call this with no arguments when the user asks for a story.
     """
-    try:
-        data = json.loads(knowledge_json)
-    except json.JSONDecodeError:
-        return "Error: invalid knowledge format."
+    # Load directly from DB — no LLM truncation risk
+    conn = get_connection()
+    cursor = conn.cursor()
+    cutoff = "datetime('now', '-24 hours')"
 
-    new = data.get("new", {})
-    old = data.get("old", {})
+    cursor.execute(f"SELECT word FROM vocabulary WHERE learned_at >= {cutoff}")
+    new_words = [r[0] for r in cursor.fetchall()]
 
-    new_words = [v["word"] for v in new.get("vocabulary", [])]
-    new_rules = [g["rule"] for g in new.get("grammar", [])]
-    new_exprs = [e["expression"] for e in new.get("expressions", [])]
+    cursor.execute(f"SELECT word FROM vocabulary WHERE learned_at < {cutoff}")
+    old_words = [r[0] for r in cursor.fetchall()]
 
-    old_words = [v["word"] for v in old.get("vocabulary", [])]
-    old_rules = [g["rule"] for g in old.get("grammar", [])]
-    old_exprs = [e["expression"] for e in old.get("expressions", [])]
+    cursor.execute(f"SELECT rule FROM grammar WHERE learned_at >= {cutoff}")
+    new_rules = [r[0] for r in cursor.fetchall()]
 
-    return json.dumps({
-        "instruction": (
-            "Write a short, engaging story in Italian (10-15 sentences).\n\n"
-            f"TODAY'S NEW items — use these as the main focus:\n"
-            f"  Vocabulary:   {new_words}\n"
-            f"  Grammar:      {new_rules}\n"
-            f"  Expressions:  {new_exprs}\n\n"
-            f"OLDER items — weave these in naturally:\n"
-            f"  Vocabulary:   {old_words}\n"
-            f"  Grammar:      {old_rules}\n"
-            f"  Expressions:  {old_exprs}\n\n"
-            "Formatting rules:\n"
-            "1. Match difficulty to the vocabulary/grammar level above.\n"
-            "2. Bold every new word using **word** in the Italian text.\n"
-            "3. After the story, add an English translation.\n"
-            "4. End with: 'Parole nuove usate: ...' listing the new words used."
-        )
-    })
+    cursor.execute(f"SELECT rule FROM grammar WHERE learned_at < {cutoff}")
+    old_rules = [r[0] for r in cursor.fetchall()]
 
+    conn.close()
+
+    if not new_words and not old_words:
+        return "No knowledge saved yet. Process a book page first."
+
+    return (
+        "Write a short, engaging story in Italian (10-15 sentences).\n\n"
+        f"TODAY'S NEW items — use these as the main focus:\n"
+        f"  Vocabulary: {new_words}\n"
+        f"  Grammar:    {new_rules}\n\n"
+        f"OLDER items — weave these in naturally:\n"
+        f"  Vocabulary: {old_words}\n"
+        f"  Grammar:    {old_rules}\n\n"
+        "Formatting rules:\n"
+        "1. Match difficulty to the vocabulary/grammar level above.\n"
+        "2. Bold every new word using **word** in the Italian text.\n"
+        "3. After the story, add an English translation.\n"
+        "4. End with: 'Parole nuove usate: ...' listing the new words used."
+    )
 
 # Initialize DB when tools.py is imported
 init_db()
